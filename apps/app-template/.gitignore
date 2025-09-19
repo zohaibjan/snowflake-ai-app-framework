@@ -1,0 +1,12 @@
+# Do not commit secrets
+.env
+.env.*
+!.env.example
+
+# Streamlit
+.streamlit/
+logs/
+
+# Python
+__pycache__/
+*.py[cod]

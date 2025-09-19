@@ -43,12 +43,23 @@ SNOWFLAKE_SCHEMA=your_schema
 SNOWFLAKE_WAREHOUSE=your_warehouse
 ```
 
+Additional optional secrets used by some templates:
+
+```
+APP_USER_PASSWORD=strong-password-for-app-user
+```
+
 ## Configuration Notes
 
 - Service names are auto-generated based on repository name
 - Resource allocation can be customized per environment
 - All deployments use private key authentication for security
 - Workflows include automatic cleanup on failure
+
+### Container Registry Login
+- Workflows use the Snowflake registry returned by `SYSTEM$REGISTRY_HOSTNAME()`
+- Docker authenticates to the Snowflake registry via `docker login` using the Snowflake user and the private key provided in secrets
+- Ensure the Snowflake user has rights to the image repository in APPS_DB.AI_APPS
 
 ## Troubleshooting
 
@@ -68,6 +79,8 @@ Common issues and solutions:
 - Verify compute pool exists
 - Check service resource limits
 - Review container service logs in Snowflake
+	- `SELECT SYSTEM$GET_SERVICE_LOGS('<service_name>', 0, '<container_name>');`
+	- Check `SHOW SERVICES LIKE '<service_name>'` for status
 
 ## Customization
 
