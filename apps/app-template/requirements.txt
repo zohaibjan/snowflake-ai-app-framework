@@ -1,0 +1,10 @@
+streamlit>=1.28.0
+snowflake-snowpark-python>=1.9.0
+pandas>=2.0.0
+python-dotenv>=1.0.0
+Pillow>=10.0.0
+PyPDF2>=3.0.0
+python-docx>=0.8.11
+plotly>=5.17.0
+# Note: Snowflake Cortex AI uses existing Snowflake connection
+# No additional AI API packages needed

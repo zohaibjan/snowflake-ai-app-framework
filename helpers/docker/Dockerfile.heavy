@@ -1,0 +1,104 @@
+# Heavy Dependencies Dockerfile
+# For applications requiring ML libraries, PDF processing, and data science tools
+# Larger image size but includes comprehensive functionality
+
+FROM python:3.11-slim
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    STREAMLIT_SERVER_PORT=8501 \
+    STREAMLIT_SERVER_ADDRESS=0.0.0.0 \
+    STREAMLIT_SERVER_ENABLE_CORS=false \
+    STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION=false \
+    STREAMLIT_SERVER_HEADLESS=true
+
+# Install comprehensive system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    gfortran \
+    libblas-dev \
+    liblapack-dev \
+    libatlas-base-dev \
+    libhdf5-dev \
+    pkg-config \
+    curl \
+    wget \
+    git \
+    build-essential \
+    poppler-utils \
+    tesseract-ocr \
+    libtesseract-dev \
+    libleptonica-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd --create-home --shell /bin/bash appuser
+
+# Set working directory
+WORKDIR /app
+
+# Copy requirements first for better caching
+COPY requirements.txt .
+
+# Install core dependencies first
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# Install heavy dependencies in separate layer
+RUN pip install --no-cache-dir \
+    numpy \
+    pandas \
+    scipy \
+    scikit-learn \
+    matplotlib \
+    seaborn \
+    plotly
+
+# Install PDF processing dependencies
+RUN pip install --no-cache-dir \
+    PyPDF2 \
+    pypdf \
+    pdfplumber \
+    pdf2image \
+    pytesseract
+
+# Install remaining requirements
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Create necessary directories
+RUN mkdir -p /app/.streamlit /app/temp && \
+    chown -R appuser:appuser /app
+
+# Create Streamlit config with optimizations for heavy apps
+RUN echo '[server]' > /app/.streamlit/config.toml && \
+    echo 'port = 8501' >> /app/.streamlit/config.toml && \
+    echo 'address = "0.0.0.0"' >> /app/.streamlit/config.toml && \
+    echo 'headless = true' >> /app/.streamlit/config.toml && \
+    echo 'enableCORS = false' >> /app/.streamlit/config.toml && \
+    echo 'enableXsrfProtection = false' >> /app/.streamlit/config.toml && \
+    echo 'maxUploadSize = 200' >> /app/.streamlit/config.toml && \
+    echo 'maxMessageSize = 200' >> /app/.streamlit/config.toml
+
+# Set matplotlib backend
+RUN echo 'import matplotlib; matplotlib.use("Agg")' > /app/matplotlib_config.py
+
+# Switch to non-root user
+USER appuser
+
+# Set Python path to include config
+ENV PYTHONPATH="/app:${PYTHONPATH}"
+
+# Expose port
+EXPOSE 8501
+
+# Extended health check for heavy apps
+HEALTHCHECK --interval=45s --timeout=15s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8501/_stcore/health || exit 1
+
+# Run with optimizations for heavy applications
+CMD ["python", "-c", "exec(open('matplotlib_config.py').read()); exec(open('-c streamlit run app.py --server.fileWatcherType none').read())" ] || \
+    ["streamlit", "run", "app.py", "--server.fileWatcherType", "none"]

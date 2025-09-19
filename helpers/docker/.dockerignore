@@ -1,0 +1,128 @@
+# Dockerfile ignore patterns
+# Excludes unnecessary files from Docker build context to improve build performance
+
+# Version control
+.git/
+.gitignore
+.gitattributes
+
+# Documentation
+README.md
+docs/
+*.md
+*.rst
+
+# Development files
+.vscode/
+.idea/
+*.code-workspace
+
+# Environment files
+.env
+.env.local
+.env.*.local
+venv/
+env/
+.venv/
+
+# Python cache and artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Jupyter notebooks (optional - remove if needed)
+*.ipynb
+.jupyter/
+.ipynb_checkpoints/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs and temporary files
+*.log
+logs/
+temp/
+tmp/
+*.tmp
+*.bak
+*.swp
+*~
+
+# Node.js (if applicable)
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Build artifacts
+build/
+dist/
+*.egg
+*.wheel
+
+# IDE files
+*.sublime-project
+*.sublime-workspace
+.vscode/settings.json
+.vscode/launch.json
+
+# Test files
+tests/
+test_*.py
+*_test.py
+pytest.ini
+tox.ini
+
+# Deployment files (keep these out of container)
+docker-compose.yml
+docker-compose.yaml
+Dockerfile*
+.dockerignore
+
+# CI/CD files
+.github/
+.gitlab-ci.yml
+Jenkinsfile
+azure-pipelines.yml
+
+# Local configuration
+config.local.*
+secrets/
+.secrets/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Large data files (consider)
+data/
+datasets/
+*.csv
+*.json
+*.parquet
+*.xlsx
+
+# Model files (consider if large)
+models/
+*.pkl
+*.joblib
+*.h5
+*.pb
+
+# Backup files
+backup/
+backups/
+*.backup

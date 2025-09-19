@@ -1,0 +1,217 @@
+#!/bin/bash
+# App Setup Script Template
+# This script creates all necessary Snowflake objects for a specific app
+# Replace {{APP_NAME}} with your actual app name
+
+set -e
+
+APP_NAME="{{APP_NAME}}"
+APP_USER="${APP_NAME}_USER"
+APP_STAGE="${APP_NAME}_STAGE"
+APP_LOGS_TABLE="${APP_NAME}_LOGS"
+
+echo "🚀 Setting up Snowflake objects for ${APP_NAME}..."
+
+# Check if snowflake CLI is available
+if ! command -v snow &> /dev/null; then
+    echo "❌ Snowflake CLI not found. Please install snowflake-cli-labs."
+    exit 1
+fi
+
+# Test connection
+echo "🔍 Testing Snowflake connection..."
+snow sql -q "SELECT CURRENT_VERSION();" > /dev/null
+echo "✅ Connected to Snowflake successfully"
+
+# Create app-specific stage
+echo "📁 Creating app-specific stage: ${APP_STAGE}"
+snow sql -q "CREATE STAGE IF NOT EXISTS ${APP_STAGE} 
+DIRECTORY = ( ENABLE = TRUE )
+COMMENT = 'Stage for ${APP_NAME} application files and uploads';"
+
+# Create app-specific logs table
+echo "📋 Creating app-specific logs table: ${APP_LOGS_TABLE}"
+snow sql -q "CREATE TABLE IF NOT EXISTS ${APP_LOGS_TABLE} (
+    ID NUMBER AUTOINCREMENT PRIMARY KEY,
+    LOG_LEVEL VARCHAR(20) NOT NULL,
+    LOG_MESSAGE TEXT NOT NULL,
+    LOG_DATA VARIANT,
+    USER_SESSION VARCHAR(100),
+    ENDPOINT_URL VARCHAR(500),
+    CREATED_AT TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP()
+) COMMENT = 'Application logs for ${APP_NAME}';"
+
+# Create app-specific feedback table
+echo "💬 Creating app-specific feedback table: ${APP_NAME}_FEEDBACK"
+snow sql -q "CREATE TABLE IF NOT EXISTS ${APP_NAME}_FEEDBACK (
+    ID NUMBER AUTOINCREMENT PRIMARY KEY,
+    USER_SESSION VARCHAR(100),
+    FEEDBACK_TYPE VARCHAR(50) NOT NULL,
+    FEEDBACK_TEXT TEXT,
+    RATING NUMBER(1,0) CHECK (RATING BETWEEN 1 AND 5),
+    METADATA VARIANT,
+    CREATED_AT TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP()
+) COMMENT = 'User feedback for ${APP_NAME} application';"
+
+# Create app-specific analysis results table (if it's an AI app)
+echo "🤖 Creating analysis results table: ${APP_NAME}_ANALYSIS"
+snow sql -q "CREATE TABLE IF NOT EXISTS ${APP_NAME}_ANALYSIS (
+    ID NUMBER AUTOINCREMENT PRIMARY KEY,
+    DOCUMENT_NAME VARCHAR(500) NOT NULL,
+    DOCUMENT_STAGE_PATH VARCHAR(1000),
+    ANALYSIS_TYPE VARCHAR(100) NOT NULL,
+    ANALYSIS_PROVIDER VARCHAR(50),
+    ANALYSIS_RESULTS VARIANT,
+    PROCESSING_TIME_SECONDS NUMBER(10,2),
+    STATUS VARCHAR(50) DEFAULT 'COMPLETED',
+    ERROR_MESSAGE TEXT,
+    USER_SESSION VARCHAR(100),
+    CREATED_AT TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP()
+) COMMENT = 'Analysis results for ${APP_NAME} application';"
+
+# Create app-specific user
+echo "👤 Creating app-specific user: ${APP_USER}"
+# Generate a random password if APP_USER_PASSWORD is not set
+if [ -z "$APP_USER_PASSWORD" ]; then
+    APP_USER_PASSWORD=$(openssl rand -base64 32)
+    echo "🔐 Generated password for ${APP_USER}: ${APP_USER_PASSWORD}"
+    echo "Please save this password securely!"
+fi
+
+snow sql -q "CREATE USER IF NOT EXISTS ${APP_USER} 
+PASSWORD = '${APP_USER_PASSWORD}' 
+DEFAULT_ROLE = 'APP_DEVELOPER'
+COMMENT = 'Service user for ${APP_NAME} application';" || echo "⚠️  User might already exist"
+
+# Grant permissions to app user
+echo "🔐 Granting permissions to ${APP_USER}..."
+
+# Stage permissions
+snow sql -q "GRANT USAGE ON STAGE ${APP_STAGE} TO USER ${APP_USER};" || echo "⚠️  Stage permissions might already be granted"
+snow sql -q "GRANT READ, WRITE ON STAGE ${APP_STAGE} TO USER ${APP_USER};" || echo "⚠️  Stage R/W permissions might already be granted"
+
+# Table permissions
+snow sql -q "GRANT ALL PRIVILEGES ON TABLE ${APP_LOGS_TABLE} TO USER ${APP_USER};" || echo "⚠️  Logs table permissions might already be granted"
+snow sql -q "GRANT ALL PRIVILEGES ON TABLE ${APP_NAME}_FEEDBACK TO USER ${APP_USER};" || echo "⚠️  Feedback table permissions might already be granted"
+snow sql -q "GRANT ALL PRIVILEGES ON TABLE ${APP_NAME}_ANALYSIS TO USER ${APP_USER};" || echo "⚠️  Analysis table permissions might already be granted"
+
+# Warehouse permissions
+snow sql -q "GRANT USAGE ON WAREHOUSE \$SNOWFLAKE_WAREHOUSE TO USER ${APP_USER};" || echo "⚠️  Warehouse permissions might already be granted"
+
+# Create app-specific monitoring view
+echo "📊 Creating monitoring view: ${APP_NAME}_HEALTH_VIEW"
+snow sql -q "CREATE OR REPLACE VIEW ${APP_NAME}_HEALTH_VIEW AS
+SELECT 
+    '${APP_NAME}' AS APP_NAME,
+    COUNT(CASE WHEN LOG_LEVEL = 'ERROR' AND CREATED_AT >= DATEADD('hour', -1, CURRENT_TIMESTAMP()) THEN 1 END) AS RECENT_ERRORS,
+    COUNT(CASE WHEN CREATED_AT >= DATEADD('hour', -24, CURRENT_TIMESTAMP()) THEN 1 END) AS DAILY_LOG_COUNT,
+    MAX(CREATED_AT) AS LAST_ACTIVITY,
+    (SELECT AVG(RATING) FROM ${APP_NAME}_FEEDBACK WHERE CREATED_AT >= DATEADD('day', -7, CURRENT_TIMESTAMP())) AS AVG_RATING,
+    (SELECT COUNT(*) FROM ${APP_NAME}_ANALYSIS WHERE STATUS = 'COMPLETED' AND CREATED_AT >= DATEADD('day', -1, CURRENT_TIMESTAMP())) AS DAILY_SUCCESSFUL_ANALYSES
+FROM ${APP_LOGS_TABLE};"
+
+# Create app-specific procedure for logging
+echo "📝 Creating logging procedure: LOG_${APP_NAME}_EVENT"
+snow sql -q "CREATE OR REPLACE PROCEDURE LOG_${APP_NAME}_EVENT(
+    LOG_LEVEL_PARAM VARCHAR,
+    MESSAGE_PARAM VARCHAR,
+    DATA_PARAM VARIANT DEFAULT NULL,
+    SESSION_PARAM VARCHAR DEFAULT NULL,
+    ENDPOINT_PARAM VARCHAR DEFAULT NULL
+)
+RETURNS STRING
+LANGUAGE SQL
+AS
+\$\$
+BEGIN
+    INSERT INTO ${APP_LOGS_TABLE} (LOG_LEVEL, LOG_MESSAGE, LOG_DATA, USER_SESSION, ENDPOINT_URL)
+    VALUES (:LOG_LEVEL_PARAM, :MESSAGE_PARAM, :DATA_PARAM, :SESSION_PARAM, :ENDPOINT_PARAM);
+    
+    RETURN 'Event logged successfully for ${APP_NAME}';
+END;
+\$\$;"
+
+# Create app-specific cleanup procedure
+echo "🧹 Creating cleanup procedure: CLEANUP_${APP_NAME}_DATA"
+snow sql -q "CREATE OR REPLACE PROCEDURE CLEANUP_${APP_NAME}_DATA(DAYS_TO_KEEP NUMBER DEFAULT 30)
+RETURNS STRING
+LANGUAGE SQL
+AS
+\$\$
+DECLARE
+    logs_deleted NUMBER;
+    feedback_deleted NUMBER;
+    analysis_deleted NUMBER;
+BEGIN
+    -- Clean old logs
+    DELETE FROM ${APP_LOGS_TABLE} 
+    WHERE CREATED_AT < DATEADD('day', -:DAYS_TO_KEEP, CURRENT_TIMESTAMP());
+    logs_deleted := SQLROWCOUNT;
+    
+    -- Clean old feedback (optional, usually keep longer)
+    DELETE FROM ${APP_NAME}_FEEDBACK 
+    WHERE CREATED_AT < DATEADD('day', -(2 * :DAYS_TO_KEEP), CURRENT_TIMESTAMP());
+    feedback_deleted := SQLROWCOUNT;
+    
+    -- Clean old analysis results (optional)
+    DELETE FROM ${APP_NAME}_ANALYSIS 
+    WHERE CREATED_AT < DATEADD('day', -:DAYS_TO_KEEP, CURRENT_TIMESTAMP()) 
+    AND STATUS IN ('COMPLETED', 'FAILED');
+    analysis_deleted := SQLROWCOUNT;
+    
+    RETURN 'Cleanup completed for ${APP_NAME}: ' || logs_deleted || ' logs, ' || 
+           feedback_deleted || ' feedback entries, ' || analysis_deleted || ' analysis results deleted';
+END;
+\$\$;"
+
+# Verify setup
+echo "✅ Verifying setup for ${APP_NAME}..."
+
+# Check stage
+STAGE_EXISTS=$(snow sql -q "SHOW STAGES LIKE '${APP_STAGE}';" --format=json | jq 'length > 0')
+if [ "$STAGE_EXISTS" = "true" ]; then
+    echo "✅ Stage ${APP_STAGE} exists"
+else
+    echo "❌ Stage ${APP_STAGE} not found"
+fi
+
+# Check tables
+TABLES_COUNT=$(snow sql -q "SHOW TABLES LIKE '${APP_NAME}%';" --format=json | jq 'length')
+echo "✅ Created $TABLES_COUNT tables for ${APP_NAME}"
+
+# Check user
+USER_EXISTS=$(snow sql -q "SHOW USERS LIKE '${APP_USER}';" --format=json | jq 'length > 0')
+if [ "$USER_EXISTS" = "true" ]; then
+    echo "✅ User ${APP_USER} exists"
+else
+    echo "❌ User ${APP_USER} not found"
+fi
+
+# Display summary
+echo ""
+echo "🎉 Setup complete for ${APP_NAME}!"
+echo ""
+echo "📋 Created Resources:"
+echo "   📁 Stage: ${APP_STAGE}"
+echo "   👤 User: ${APP_USER}"
+echo "   📊 Tables: ${APP_LOGS_TABLE}, ${APP_NAME}_FEEDBACK, ${APP_NAME}_ANALYSIS"
+echo "   📈 View: ${APP_NAME}_HEALTH_VIEW"
+echo "   ⚙️  Procedures: LOG_${APP_NAME}_EVENT, CLEANUP_${APP_NAME}_DATA"
+echo ""
+echo "🔐 App User Credentials:"
+echo "   Username: ${APP_USER}"
+echo "   Password: ${APP_USER_PASSWORD}"
+echo ""
+echo "⚠️  Please save the app user password securely!"
+echo "💡 You can now deploy ${APP_NAME} using GitHub Actions"
+
+# Test app user connection (optional)
+read -p "🔍 Test app user connection? (y/N): " -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    echo "🧪 Testing connection as ${APP_USER}..."
+    # This would need the password to be provided securely
+    echo "⚠️  Manual testing required with app user credentials"
+fi
+
+echo "✅ All done! ${APP_NAME} is ready for deployment."

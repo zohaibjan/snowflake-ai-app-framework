@@ -1,0 +1,260 @@
+name: Deploy {{APP_NAME}} to Snowflake Container Services
+
+on:
+  push:
+    branches: [ main ]
+    paths: [ 'apps/{{APP_NAME}}/**' ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+        - production
+        - staging
+        - development
+
+env:
+  APP_NAME: {{APP_NAME}}
+  SERVICE_NAME: {{APP_NAME}}-${{ github.event.inputs.environment || 'prod' }}
+  IMAGE_NAME: {{APP_NAME}}_app
+  COMPUTE_POOL: ${{ github.event.inputs.environment == 'development' && 'DEV_POOL' || github.event.inputs.environment == 'staging' && 'STAGING_POOL' || 'APP_POOL' }}
+  MIN_INSTANCES: ${{ github.event.inputs.environment == 'development' && '1' || github.event.inputs.environment == 'staging' && '1' || '1' }}
+  MAX_INSTANCES: ${{ github.event.inputs.environment == 'development' && '1' || github.event.inputs.environment == 'staging' && '2' || '3' }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'production' }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Snowflake CLI
+      uses: Snowflake-Labs/snowflake-cli-action@v1
+      with:
+        cli-version: "latest"
+        default-config-file-path: "config.toml"
+
+    - name: Create Snowflake config
+      run: |
+        mkdir -p ~/.snowflake
+        cat > ~/.snowflake/config.toml << EOF
+        [connections.default]
+        account = "${{ secrets.SNOWFLAKE_ACCOUNT }}"
+        user = "${{ secrets.SNOWFLAKE_USER }}"
+        private_key_path = "~/.snowflake/private_key.pem"
+        database = "${{ secrets.SNOWFLAKE_DATABASE }}"
+        schema = "${{ secrets.SNOWFLAKE_SCHEMA }}"
+        warehouse = "${{ secrets.SNOWFLAKE_WAREHOUSE }}"
+        EOF
+
+    - name: Setup private key
+      run: |
+        echo "${{ secrets.SNOWFLAKE_PRIVATE_KEY }}" > ~/.snowflake/private_key.pem
+        chmod 600 ~/.snowflake/private_key.pem
+
+    - name: Test Snowflake connection
+      run: |
+        snow sql -q "SELECT CURRENT_VERSION();"
+
+    - name: Setup app-specific Snowflake objects
+      run: |
+        # Create app-specific stage
+        snow sql -q "CREATE STAGE IF NOT EXISTS {{APP_NAME}}_STAGE 
+        DIRECTORY = ( ENABLE = TRUE )
+        COMMENT = 'Stage for {{APP_NAME}} application files';"
+        
+        # Create app-specific user if not exists
+        snow sql -q "CREATE USER IF NOT EXISTS {{APP_NAME}}_USER 
+        PASSWORD = '${{ secrets.APP_USER_PASSWORD }}' 
+        DEFAULT_ROLE = 'APP_DEVELOPER'
+        COMMENT = 'Service user for {{APP_NAME}} application';" || true
+        
+        # Create app-specific table for logs
+        snow sql -q "CREATE TABLE IF NOT EXISTS {{APP_NAME}}_LOGS (
+          ID NUMBER AUTOINCREMENT PRIMARY KEY,
+          LOG_LEVEL VARCHAR(20) NOT NULL,
+          LOG_MESSAGE TEXT NOT NULL,
+          LOG_DATA VARIANT,
+          USER_SESSION VARCHAR(100),
+          CREATED_AT TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP()
+        ) COMMENT = 'Application logs for {{APP_NAME}}';"
+        
+        # Grant permissions to app user
+        snow sql -q "GRANT USAGE ON STAGE {{APP_NAME}}_STAGE TO USER {{APP_NAME}}_USER;" || true
+        snow sql -q "GRANT ALL PRIVILEGES ON TABLE {{APP_NAME}}_LOGS TO USER {{APP_NAME}}_USER;" || true
+
+    - name: Create compute pool if not exists
+      run: |
+        snow sql -q "CREATE COMPUTE POOL IF NOT EXISTS ${{ env.COMPUTE_POOL }}
+        MIN_NODES = 1
+        MAX_NODES = ${{ env.MAX_INSTANCES }}
+        INSTANCE_FAMILY = CPU_X64_XS
+        AUTO_RESUME = TRUE
+        AUTO_SUSPEND_SECS = 3600;"
+
+    - name: Build and push Docker image
+      working-directory: apps/${{ env.APP_NAME }}
+      run: |
+        # Get registry URL
+        REGISTRY_URL=$(snow sql -q "SELECT SYSTEM$REGISTRY_HOSTNAME();" --format=json | jq -r '.[0]["SYSTEM$REGISTRY_HOSTNAME()"]')
+        FULL_IMAGE_NAME="${REGISTRY_URL}/${{ secrets.SNOWFLAKE_DATABASE }}/${{ secrets.SNOWFLAKE_SCHEMA }}/${{ env.IMAGE_NAME }}:latest"
+        
+        echo "Building image for {{APP_NAME}}: $FULL_IMAGE_NAME"
+        
+        # Replace template variables in Dockerfile
+        sed 's/{{APP_NAME}}/${{ env.APP_NAME }}/g' Dockerfile > Dockerfile.build
+        
+        # Build and tag image
+        docker build -f Dockerfile.build -t "$FULL_IMAGE_NAME" .
+        
+        # Login to Snowflake registry
+        docker login "$REGISTRY_URL" -u "${{ secrets.SNOWFLAKE_USER }}" --password-stdin <<< "${{ secrets.SNOWFLAKE_PRIVATE_KEY }}"
+        
+        # Push image
+        docker push "$FULL_IMAGE_NAME"
+        
+        echo "IMAGE_FULL_NAME=$FULL_IMAGE_NAME" >> $GITHUB_ENV
+
+    - name: Deploy container service
+      run: |
+        # Create or replace the service with app-specific configuration
+        snow sql -q "CREATE OR REPLACE SERVICE ${{ env.SERVICE_NAME }}
+        IN COMPUTE POOL ${{ env.COMPUTE_POOL }}
+        FROM SPECIFICATION \$\$
+        {
+          \"spec\": {
+            \"containers\": [
+              {
+                \"name\": \"{{APP_NAME}}-container\",
+                \"image\": \"${{ env.IMAGE_FULL_NAME }}\",
+                \"resources\": {
+                  \"requests\": {
+                    \"cpu\": \"0.5\",
+                    \"memory\": \"512Mi\"
+                  },
+                  \"limits\": {
+                    \"cpu\": \"1.0\",
+                    \"memory\": \"1Gi\"
+                  }
+                },
+                \"env\": {
+                  \"STREAMLIT_SERVER_PORT\": \"8501\",
+                  \"APP_NAME\": \"{{APP_NAME}}\",
+                  \"ENVIRONMENT\": \"${{ github.event.inputs.environment || 'production' }}\",
+                  \"SNOWFLAKE_ACCOUNT\": \"${{ secrets.SNOWFLAKE_ACCOUNT }}\",
+                  \"SNOWFLAKE_USER\": \"{{APP_NAME}}_USER\",
+                  \"SNOWFLAKE_DATABASE\": \"${{ secrets.SNOWFLAKE_DATABASE }}\",
+                  \"SNOWFLAKE_SCHEMA\": \"${{ secrets.SNOWFLAKE_SCHEMA }}\",
+                  \"SNOWFLAKE_WAREHOUSE\": \"${{ secrets.SNOWFLAKE_WAREHOUSE }}\",
+                  \"APP_STAGE\": \"{{APP_NAME}}_STAGE\"
+                },
+                \"volumeMounts\": [
+                  {
+                    \"name\": \"app-logs\",
+                    \"mountPath\": \"/app/logs\"
+                  }
+                ]
+              }
+            ],
+            \"endpoints\": [
+              {
+                \"name\": \"{{APP_NAME}}-endpoint\",
+                \"port\": 8501,
+                \"public\": true
+              }
+            ],
+            \"volumes\": [
+              {
+                \"name\": \"app-logs\",
+                \"source\": \"local\",
+                \"size\": \"1Gi\"
+              }
+            ]
+          }
+        }
+        \$\$
+        MIN_INSTANCES = ${{ env.MIN_INSTANCES }}
+        MAX_INSTANCES = ${{ env.MAX_INSTANCES }}
+        COMMENT = 'Container service for {{APP_NAME}} application';"
+
+    - name: Wait for service to be ready
+      run: |
+        echo "Waiting for {{APP_NAME}} service to start..."
+        for i in {1..30}; do
+          STATUS=$(snow sql -q "SHOW SERVICES LIKE '${{ env.SERVICE_NAME }}';" --format=json | jq -r '.[0].status // "PENDING"')
+          echo "Service status: $STATUS"
+          
+          if [ "$STATUS" = "READY" ]; then
+            echo "✅ {{APP_NAME}} service is ready!"
+            break
+          elif [ "$STATUS" = "FAILED" ]; then
+            echo "❌ {{APP_NAME}} service failed to start!"
+            snow sql -q "SELECT SYSTEM$GET_SERVICE_LOGS('${{ env.SERVICE_NAME }}', 0, '{{APP_NAME}}-container');"
+            exit 1
+          fi
+          
+          sleep 10
+        done
+
+    - name: Get service endpoint and validate
+      run: |
+        ENDPOINT=$(snow sql -q "SHOW ENDPOINTS IN SERVICE ${{ env.SERVICE_NAME }};" --format=json | jq -r '.[0].ingress_url // "Not available"')
+        echo "🚀 {{APP_NAME}} deployed successfully!"
+        echo "🌐 Endpoint: $ENDPOINT"
+        
+        # Log deployment to app table
+        snow sql -q "CALL LOG_APP_EVENT('{{APP_NAME}}', '${{ env.SERVICE_NAME }}', 'INFO', 'Application deployed successfully', 
+        PARSE_JSON('{\"endpoint\": \"$ENDPOINT\", \"environment\": \"${{ github.event.inputs.environment || 'production' }}\", \"image\": \"${{ env.IMAGE_FULL_NAME }}\"}'), 'DEPLOYMENT');"
+        
+        # Basic health check if endpoint is available
+        if [ "$ENDPOINT" != "Not available" ]; then
+          echo "🔍 Running health check..."
+          for i in {1..5}; do
+            if curl -f -s "$ENDPOINT/_stcore/health" > /dev/null; then
+              echo "✅ {{APP_NAME}} is responding correctly"
+              break
+            else
+              echo "⏳ Waiting for app to respond... ($i/5)"
+              sleep 15
+            fi
+          done
+        fi
+        
+        # Add to GitHub step summary
+        echo "## {{APP_NAME}} Deployment Complete 🚀" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "- **App Name**: {{APP_NAME}}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Service Name**: ${{ env.SERVICE_NAME }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Environment**: ${{ github.event.inputs.environment || 'production' }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Image**: ${{ env.IMAGE_FULL_NAME }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Endpoint**: $ENDPOINT" >> $GITHUB_STEP_SUMMARY
+        echo "- **Status**: Ready ✅" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### App-Specific Resources Created" >> $GITHUB_STEP_SUMMARY
+        echo "- **Stage**: {{APP_NAME}}_STAGE" >> $GITHUB_STEP_SUMMARY
+        echo "- **User**: {{APP_NAME}}_USER" >> $GITHUB_STEP_SUMMARY
+        echo "- **Logs Table**: {{APP_NAME}}_LOGS" >> $GITHUB_STEP_SUMMARY
+
+    - name: Cleanup on failure
+      if: failure()
+      run: |
+        echo "❌ {{APP_NAME}} deployment failed, cleaning up..."
+        
+        # Get service logs for debugging
+        echo "📋 Getting service logs..."
+        snow sql -q "SELECT SYSTEM$GET_SERVICE_LOGS('${{ env.SERVICE_NAME }}', 0, '{{APP_NAME}}-container');" || echo "Could not retrieve logs"
+        
+        # Log failure
+        snow sql -q "CALL LOG_APP_EVENT('{{APP_NAME}}', '${{ env.SERVICE_NAME }}', 'ERROR', 'Deployment failed', 
+        PARSE_JSON('{\"environment\": \"${{ github.event.inputs.environment || 'production' }}\", \"image\": \"${{ env.IMAGE_FULL_NAME }}\"}'), 'DEPLOYMENT');" || echo "Could not log failure"
+        
+        # Drop the failed service
+        echo "🧹 Removing failed service..."
+        snow sql -q "DROP SERVICE IF EXISTS ${{ env.SERVICE_NAME }};" || echo "Could not drop service"
+        
+        echo "✅ Cleanup completed"

@@ -1,0 +1,227 @@
+name: Deploy to Staging Environment
+
+on:
+  push:
+    branches: [ develop, staging ]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy (default: latest)'
+        required: false
+        default: 'latest'
+        type: string
+
+env:
+  SERVICE_NAME: ${{ github.event.repository.name }}-staging
+  IMAGE_NAME: ${{ github.event.repository.name }}
+  COMPUTE_POOL: STAGING_POOL
+  MIN_INSTANCES: 1
+  MAX_INSTANCES: 2
+
+jobs:
+  deploy-staging:
+    runs-on: ubuntu-latest
+    environment: staging
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Snowflake CLI
+      uses: Snowflake-Labs/snowflake-cli-action@v1
+      with:
+        cli-version: "latest"
+        default-config-file-path: "config.toml"
+
+    - name: Create Snowflake config
+      run: |
+        mkdir -p ~/.snowflake
+        cat > ~/.snowflake/config.toml << EOF
+        [connections.default]
+        account = "${{ secrets.SNOWFLAKE_ACCOUNT }}"
+        user = "${{ secrets.SNOWFLAKE_USER }}"
+        private_key_path = "~/.snowflake/private_key.pem"
+        database = "${{ secrets.SNOWFLAKE_DATABASE }}"
+        schema = "${{ secrets.SNOWFLAKE_SCHEMA }}"
+        warehouse = "${{ secrets.SNOWFLAKE_WAREHOUSE }}"
+        EOF
+
+    - name: Setup private key
+      run: |
+        echo "${{ secrets.SNOWFLAKE_PRIVATE_KEY }}" > ~/.snowflake/private_key.pem
+        chmod 600 ~/.snowflake/private_key.pem
+
+    - name: Test Snowflake connection
+      run: |
+        snow sql -q "SELECT CURRENT_VERSION();"
+
+    - name: Determine image tag
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          TAG="${{ inputs.image_tag }}"
+        elif [ "${{ github.ref_name }}" = "develop" ]; then
+          TAG="develop"
+        else
+          TAG="staging"
+        fi
+        
+        echo "Using image tag: $TAG"
+        echo "IMAGE_TAG=$TAG" >> $GITHUB_ENV
+
+    - name: Create staging compute pool if not exists
+      run: |
+        snow sql -q "CREATE COMPUTE POOL IF NOT EXISTS ${{ env.COMPUTE_POOL }}
+        MIN_NODES = 1
+        MAX_NODES = 2
+        INSTANCE_FAMILY = CPU_X64_XS;"
+
+    - name: Build staging image (if needed)
+      run: |
+        # Get registry URL
+        REGISTRY_URL=$(snow sql -q "SELECT SYSTEM$REGISTRY_HOSTNAME();" --format=json | jq -r '.[0]["SYSTEM$REGISTRY_HOSTNAME()"]')
+        FULL_IMAGE_NAME="${REGISTRY_URL}/${{ secrets.SNOWFLAKE_DATABASE }}/${{ secrets.SNOWFLAKE_SCHEMA }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+        
+        # Check if image exists
+        IMAGE_EXISTS=$(snow sql -q "SHOW IMAGES IN IMAGE REPOSITORY ${{ secrets.SNOWFLAKE_DATABASE }}.${{ secrets.SNOWFLAKE_SCHEMA }}.${{ env.IMAGE_NAME }};" --format=json | jq -r --arg tag "${{ env.IMAGE_TAG }}" 'map(select(.tag == $tag)) | length > 0')
+        
+        if [ "$IMAGE_EXISTS" = "false" ]; then
+          echo "Image with tag ${{ env.IMAGE_TAG }} not found, building..."
+          
+          # Build and tag image
+          docker build -t "$FULL_IMAGE_NAME" .
+          
+          # Login to Snowflake registry
+          docker login "$REGISTRY_URL" -u "${{ secrets.SNOWFLAKE_USER }}" --password-stdin <<< "${{ secrets.SNOWFLAKE_PRIVATE_KEY }}"
+          
+          # Push image
+          docker push "$FULL_IMAGE_NAME"
+        else
+          echo "Image with tag ${{ env.IMAGE_TAG }} already exists, using existing image"
+        fi
+        
+        echo "IMAGE_FULL_NAME=$FULL_IMAGE_NAME" >> $GITHUB_ENV
+
+    - name: Stop existing staging service
+      run: |
+        # Check if service exists and stop it
+        SERVICE_EXISTS=$(snow sql -q "SHOW SERVICES LIKE '${{ env.SERVICE_NAME }}';" --format=json | jq 'length > 0')
+        
+        if [ "$SERVICE_EXISTS" = "true" ]; then
+          echo "Stopping existing staging service..."
+          snow sql -q "DROP SERVICE IF EXISTS ${{ env.SERVICE_NAME }};"
+          
+          # Wait a moment for cleanup
+          sleep 5
+        fi
+
+    - name: Deploy staging service
+      run: |
+        # Create the staging service with reduced resources
+        snow sql -q "CREATE SERVICE ${{ env.SERVICE_NAME }}
+        IN COMPUTE POOL ${{ env.COMPUTE_POOL }}
+        FROM SPECIFICATION \$\$
+        {
+          \"spec\": {
+            \"containers\": [
+              {
+                \"name\": \"app\",
+                \"image\": \"${{ env.IMAGE_FULL_NAME }}\",
+                \"resources\": {
+                  \"requests\": {
+                    \"cpu\": \"0.25\",
+                    \"memory\": \"256Mi\"
+                  },
+                  \"limits\": {
+                    \"cpu\": \"0.5\",
+                    \"memory\": \"512Mi\"
+                  }
+                },
+                \"env\": {
+                  \"STREAMLIT_SERVER_PORT\": \"8501\",
+                  \"STREAMLIT_SERVER_ENABLE_CORS\": \"false\",
+                  \"STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION\": \"false\",
+                  \"ENVIRONMENT\": \"staging\"
+                }
+              }
+            ],
+            \"endpoints\": [
+              {
+                \"name\": \"staging-endpoint\",
+                \"port\": 8501,
+                \"public\": true
+              }
+            ]
+          }
+        }
+        \$\$
+        MIN_INSTANCES = ${{ env.MIN_INSTANCES }}
+        MAX_INSTANCES = ${{ env.MAX_INSTANCES }};"
+
+    - name: Wait for staging service to be ready
+      run: |
+        echo "Waiting for staging service to start..."
+        for i in {1..20}; do
+          STATUS=$(snow sql -q "SHOW SERVICES LIKE '${{ env.SERVICE_NAME }}';" --format=json | jq -r '.[0].status // "PENDING"')
+          echo "Staging service status: $STATUS"
+          
+          if [ "$STATUS" = "READY" ]; then
+            echo "Staging service is ready!"
+            break
+          elif [ "$STATUS" = "FAILED" ]; then
+            echo "Staging service failed to start!"
+            # Get logs for debugging
+            snow sql -q "SELECT SYSTEM$GET_SERVICE_LOGS('${{ env.SERVICE_NAME }}', 0, 'app');"
+            exit 1
+          fi
+          
+          sleep 10
+        done
+
+    - name: Get staging endpoint and run basic tests
+      run: |
+        ENDPOINT=$(snow sql -q "SHOW ENDPOINTS IN SERVICE ${{ env.SERVICE_NAME }};" --format=json | jq -r '.[0].ingress_url // "Not available"')
+        echo "🧪 Staging deployment complete!"
+        echo "🌐 Staging Endpoint: $ENDPOINT"
+        
+        # Basic health check (if endpoint is available)
+        if [ "$ENDPOINT" != "Not available" ]; then
+          echo "Running basic health check..."
+          for i in {1..5}; do
+            if curl -f -s "$ENDPOINT" > /dev/null; then
+              echo "✅ Staging app is responding"
+              break
+            else
+              echo "⏳ Waiting for app to respond... ($i/5)"
+              sleep 10
+            fi
+          done
+        fi
+        
+        # Add to GitHub step summary
+        echo "## Staging Deployment Complete 🧪" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "- **Service Name**: ${{ env.SERVICE_NAME }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Image**: ${{ env.IMAGE_FULL_NAME }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Endpoint**: $ENDPOINT" >> $GITHUB_STEP_SUMMARY
+        echo "- **Environment**: Staging" >> $GITHUB_STEP_SUMMARY
+        echo "- **Status**: Ready for Testing ✅" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Testing Notes" >> $GITHUB_STEP_SUMMARY
+        echo "- This is a staging environment with reduced resources" >> $GITHUB_STEP_SUMMARY
+        echo "- Test thoroughly before promoting to production" >> $GITHUB_STEP_SUMMARY
+        echo "- Service will be automatically replaced on next staging deployment" >> $GITHUB_STEP_SUMMARY
+
+    - name: Cleanup on failure
+      if: failure()
+      run: |
+        echo "Staging deployment failed, cleaning up..."
+        
+        # Get service logs for debugging
+        echo "Getting service logs..."
+        snow sql -q "SELECT SYSTEM$GET_SERVICE_LOGS('${{ env.SERVICE_NAME }}', 0, 'app');" || echo "Could not retrieve logs"
+        
+        # Drop the failed service
+        echo "Removing failed staging service..."
+        snow sql -q "DROP SERVICE IF EXISTS ${{ env.SERVICE_NAME }};" || echo "Could not drop service"
+        
+        echo "Staging cleanup completed"

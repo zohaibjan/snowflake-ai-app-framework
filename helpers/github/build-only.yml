@@ -1,0 +1,148 @@
+name: Build and Push Docker Image
+
+on:
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag (default: branch name)'
+        required: false
+        type: string
+
+env:
+  IMAGE_NAME: ${{ github.event.repository.name }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Snowflake CLI
+      uses: Snowflake-Labs/snowflake-cli-action@v1
+      with:
+        cli-version: "latest"
+        default-config-file-path: "config.toml"
+
+    - name: Create Snowflake config
+      run: |
+        mkdir -p ~/.snowflake
+        cat > ~/.snowflake/config.toml << EOF
+        [connections.default]
+        account = "${{ secrets.SNOWFLAKE_ACCOUNT }}"
+        user = "${{ secrets.SNOWFLAKE_USER }}"
+        private_key_path = "~/.snowflake/private_key.pem"
+        database = "${{ secrets.SNOWFLAKE_DATABASE }}"
+        schema = "${{ secrets.SNOWFLAKE_SCHEMA }}"
+        warehouse = "${{ secrets.SNOWFLAKE_WAREHOUSE }}"
+        EOF
+
+    - name: Setup private key
+      run: |
+        echo "${{ secrets.SNOWFLAKE_PRIVATE_KEY }}" > ~/.snowflake/private_key.pem
+        chmod 600 ~/.snowflake/private_key.pem
+
+    - name: Test Snowflake connection
+      run: |
+        snow sql -q "SELECT CURRENT_VERSION();"
+
+    - name: Determine image tag
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
+          TAG="${{ inputs.tag }}"
+        elif [ "${{ github.event_name }}" = "pull_request" ]; then
+          TAG="pr-${{ github.event.pull_request.number }}"
+        else
+          TAG=$(echo "${{ github.ref_name }}" | tr '/' '-')
+        fi
+        
+        echo "Using tag: $TAG"
+        echo "IMAGE_TAG=$TAG" >> $GITHUB_ENV
+
+    - name: Build and push Docker image
+      run: |
+        # Get registry URL
+        REGISTRY_URL=$(snow sql -q "SELECT SYSTEM$REGISTRY_HOSTNAME();" --format=json | jq -r '.[0]["SYSTEM$REGISTRY_HOSTNAME()"]')
+        FULL_IMAGE_NAME="${REGISTRY_URL}/${{ secrets.SNOWFLAKE_DATABASE }}/${{ secrets.SNOWFLAKE_SCHEMA }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+        
+        echo "Building image: $FULL_IMAGE_NAME"
+        
+        # Build and tag image
+        docker build -t "$FULL_IMAGE_NAME" .
+        
+        # Also tag as latest if this is main branch
+        if [ "${{ github.ref_name }}" = "main" ]; then
+          LATEST_IMAGE="${REGISTRY_URL}/${{ secrets.SNOWFLAKE_DATABASE }}/${{ secrets.SNOWFLAKE_SCHEMA }}/${{ env.IMAGE_NAME }}:latest"
+          docker tag "$FULL_IMAGE_NAME" "$LATEST_IMAGE"
+          echo "LATEST_IMAGE=$LATEST_IMAGE" >> $GITHUB_ENV
+        fi
+        
+        # Login to Snowflake registry
+        echo "Logging in to registry..."
+        docker login "$REGISTRY_URL" -u "${{ secrets.SNOWFLAKE_USER }}" --password-stdin <<< "${{ secrets.SNOWFLAKE_PRIVATE_KEY }}"
+        
+        # Push image
+        echo "Pushing image..."
+        docker push "$FULL_IMAGE_NAME"
+        
+        # Push latest tag if applicable
+        if [ -n "$LATEST_IMAGE" ]; then
+          echo "Pushing latest tag..."
+          docker push "$LATEST_IMAGE"
+        fi
+        
+        echo "IMAGE_FULL_NAME=$FULL_IMAGE_NAME" >> $GITHUB_ENV
+
+    - name: Validate image
+      run: |
+        # List repository images to confirm push
+        echo "Images in repository:"
+        snow sql -q "SHOW IMAGES IN IMAGE REPOSITORY ${{ secrets.SNOWFLAKE_DATABASE }}.${{ secrets.SNOWFLAKE_SCHEMA }}.${{ env.IMAGE_NAME }};"
+
+    - name: Create deployment summary
+      run: |
+        echo "## Build Complete 🏗️" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "- **Image Name**: ${{ env.IMAGE_NAME }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Tag**: ${{ env.IMAGE_TAG }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Full Image**: ${{ env.IMAGE_FULL_NAME }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Status**: Built and Pushed ✅" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+        echo "- Image is ready for deployment" >> $GITHUB_STEP_SUMMARY
+        echo "- Use this image in your service specification" >> $GITHUB_STEP_SUMMARY
+        
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          echo "- This is a PR build - merge to main for production deployment" >> $GITHUB_STEP_SUMMARY
+        fi
+
+    - name: Comment on PR (if applicable)
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: `🏗️ **Docker Image Built Successfully**
+            
+            - **Image**: \`${{ env.IMAGE_FULL_NAME }}\`
+            - **Tag**: \`${{ env.IMAGE_TAG }}\`
+            - **Status**: Ready for deployment ✅
+            
+            The image has been pushed to the Snowflake registry and is ready for testing or deployment.`
+          });
+
+    - name: Cleanup on failure
+      if: failure()
+      run: |
+        echo "Build failed, performing cleanup..."
+        
+        # Remove any partially built images
+        docker image prune -f
+        
+        echo "Cleanup completed"
