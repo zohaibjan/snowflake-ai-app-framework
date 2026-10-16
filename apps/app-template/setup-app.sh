@@ -111,7 +111,6 @@ setup_snowflake_objects() {
     # Create app-specific user (optional - for production deployments)
     print_info "Creating app-specific user (this may require ACCOUNTADMIN privileges)"
     execute_sql "CREATE USER IF NOT EXISTS ${USER_NAME} 
-                 PASSWORD = 'ChangeMe123!' 
                  DEFAULT_WAREHOUSE = 'COMPUTE_WH'
                  DEFAULT_DATABASE = '${DB_NAME}'
                  DEFAULT_SCHEMA = '${SCHEMA_NAME}'
@@ -144,7 +143,7 @@ setup_snowflake_objects() {
     echo -e "   1. Update your .env file with the database and schema names"
     echo -e "   2. Test your Snowflake connection: ${BLUE}python -c 'from utils.snowflake_utils import get_snowflake_session; print(get_snowflake_session())'${NC}"
     echo -e "   3. Run your application: ${BLUE}streamlit run app.py${NC}"
-    echo -e "   4. For production, change the default password for ${USER_NAME}"
+    echo -e "   4. Configure key-pair authentication for ${USER_NAME} before use; no password is provisioned"
 }
 
 # Cleanup function (optional)
