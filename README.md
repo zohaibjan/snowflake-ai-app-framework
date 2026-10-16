@@ -1,4 +1,4 @@
-# 🚀 AI App Development Framework
+# Snowflake AI App Framework
 
 ## Framework Overview
 
@@ -215,3 +215,7 @@ Perfect for AI agents to consume and generate production-ready AI applications w
 ---
 
 *Built with ❤️ for the AI development community*
+
+## Public portfolio scope
+
+This repository contains reusable Streamlit, Snowflake Cortex and container deployment templates. It does not include a configured Snowflake account, private keys or production datasets. Create your own environment from the placeholder configuration before running an app. Deployment YAML files under `helpers/` and `templates/` are examples, not active GitHub Actions workflows. The app-template setup script provisions no default password; configure key-pair authentication separately before using the service user.
